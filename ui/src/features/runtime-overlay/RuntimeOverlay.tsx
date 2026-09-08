@@ -6,7 +6,10 @@ import type {
   RuntimeOverlaySnapshot,
 } from "../../bridge/contracts";
 import { invoke } from "../../bridge/native";
-import { overlayColor } from "./runtimeOverlayModel";
+import {
+  mergeRuntimeOverlaySnapshot,
+  overlayColor,
+} from "./runtimeOverlayModel";
 
 // Laid out like the console's own keyboard: four rows of ten, then a row of
 // modifiers. Keeping every row the same width is what makes the grid line up.
@@ -325,11 +328,7 @@ export function RuntimeOverlayRoot() {
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const accept = (next: RuntimeOverlaySnapshot) =>
-      setSnapshot((current) =>
-        !current || BigInt(next.sequence) >= BigInt(current.sequence)
-          ? next
-          : current,
-      );
+      setSnapshot((current) => mergeRuntimeOverlaySnapshot(current, next));
     const unsubscribe = subscribe((event) => {
       if (event.type === "overlay.changed")
         accept(event.payload as RuntimeOverlaySnapshot);
@@ -350,7 +349,12 @@ export function RuntimeOverlayRoot() {
     return unsubscribe;
   }, []);
   useEffect(() => {
-    if (!snapshot || snapshot.interaction === "passive") return;
+    if (
+      !snapshot ||
+      snapshot.resumeRequired ||
+      snapshot.interaction === "passive"
+    )
+      return;
     const navigate = (event: Event) => {
       const action = (event as CustomEvent<string>).detail;
       if (
@@ -451,6 +455,32 @@ export function RuntimeOverlayRoot() {
       ref={rootRef}
       className={`runtime-overlay-root runtime-overlay-root--${snapshot.interaction}`}
     >
+      {snapshot.resumeRequired && (
+        <div
+          role="status"
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 1000,
+            display: "grid",
+            placeItems: "center",
+            background: "#0006",
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              padding: "16px 24px",
+              borderRadius: 12,
+              color: "white",
+              background: "#171a21",
+              fontSize: 20,
+            }}
+          >
+            クリックで操作を再開
+          </div>
+        </div>
+      )}
       <ShaderProgress snapshot={snapshot} />
       {[...groups].map(([position, content]) => (
         <div

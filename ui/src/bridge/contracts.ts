@@ -319,6 +319,8 @@ export type OverlayTextStyle = {
   scale: number;
 };
 export type RuntimeOverlaySnapshot = {
+  resumeRequired?: boolean;
+  focusRevision?: string;
   sequence: string;
   overlayStyle: OverlayTextStyle;
   notificationStyle: OverlayTextStyle;

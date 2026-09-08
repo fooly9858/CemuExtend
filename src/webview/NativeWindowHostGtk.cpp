@@ -18,6 +18,7 @@
 #include <gdk/gdk.h>
 #include <gdk/gdkx.h>
 #include <X11/XKBlib.h>
+#include <X11/Xatom.h>
 #include <X11/extensions/XInput2.h>
 #ifdef HAS_WAYLAND
 #include <gdk/gdkwayland.h>
@@ -27,6 +28,32 @@ namespace WebFrontend
 {
 	namespace
 	{
+		std::optional<::Window> ActiveToplevelXid(GdkDisplay* gdkDisplay)
+		{
+			std::optional<::Window> active;
+			if (gdkDisplay && GDK_IS_X11_DISPLAY(gdkDisplay))
+			{
+				auto* display = gdk_x11_display_get_xdisplay(gdkDisplay);
+				const auto atom = XInternAtom(display, "_NET_ACTIVE_WINDOW", True);
+				if (atom != None)
+				{
+					Atom type{};
+					int format{};
+					unsigned long count{}, remaining{};
+					unsigned char* data{};
+					gdk_x11_display_error_trap_push(gdkDisplay);
+					const auto status = XGetWindowProperty(display, DefaultRootWindow(display),
+														   atom, 0, 1, False, XA_WINDOW, &type, &format, &count, &remaining, &data);
+					const auto error = gdk_x11_display_error_trap_pop(gdkDisplay);
+					if (!error && status == Success && type == XA_WINDOW && format == 32 && count == 1 && data)
+						active = *reinterpret_cast<unsigned long*>(data);
+					if (data)
+						XFree(data);
+				}
+			}
+			return active;
+		}
+
 		struct GtkInputBinding;
 
 		class XInput2RawMouse
@@ -117,6 +144,9 @@ namespace WebFrontend
 			const auto scale = gtk_widget_get_scale_factor(content);
 			event.contentWidth = allocation.width * scale;
 			event.contentHeight = allocation.height * scale;
+			if (event.kind == NativeInputKind::PointerButton)
+				event.insideContent = event.x >= 0 && event.y >= 0 &&
+									  event.x < event.contentWidth && event.y < event.contentHeight;
 			(*binding->handler)(event);
 		}
 
@@ -379,8 +409,20 @@ namespace WebFrontend
 								 return TRUE;
 							 })),
 							 binding);
-			g_signal_connect(keySource, "focus-in-event", G_CALLBACK((+[](GtkWidget*, GdkEventFocus*, gpointer data) -> gboolean {
-								 ++static_cast<GtkInputBinding*>(data)->focusGeneration;
+			g_signal_connect(keySource, "focus-in-event", G_CALLBACK((+[](GtkWidget* source, GdkEventFocus*, gpointer data) -> gboolean {
+								 auto* binding = static_cast<GtkInputBinding*>(data);
+								 ++binding->focusGeneration;
+								 // Keep held keys identifiable as repeats after reactivation,
+								 // but discard releases that happened in another application.
+								 auto* display = gtk_widget_get_display(source);
+								 if (display && GDK_IS_X11_DISPLAY(display))
+								 {
+									 char keys[32]{};
+									 XQueryKeymap(gdk_x11_display_get_xdisplay(display), keys);
+									 std::erase_if(binding->pressedKeys, [&keys](std::uint32_t code) {
+										 return code >= 256 || !(keys[code / 8] & (1U << (code % 8)));
+									 });
+								 }
 								 return FALSE;
 							 })),
 							 binding);
@@ -407,7 +449,6 @@ namespace WebFrontend
 										 if (toplevel && GTK_IS_WINDOW(toplevel) &&
 											 gtk_window_is_active(GTK_WINDOW(toplevel)))
 											 return G_SOURCE_REMOVE;
-										 binding->pressedKeys.clear();
 										 DispatchGtkInput(deferred->source, binding,
 														  {.kind = NativeInputKind::FocusLost});
 										 return G_SOURCE_REMOVE;
@@ -594,13 +635,8 @@ namespace WebFrontend
 										 return FALSE;
 									 }),
 									 this);
-					g_signal_connect(m_window, "focus-out-event", G_CALLBACK(+[](GtkWidget*, GdkEventFocus*, gpointer data) -> gboolean {
-										 auto& self = *static_cast<GtkPadRenderRegion*>(data);
-										 if (self.m_metricsHandler)
-											 self.m_metricsHandler();
-										 return FALSE;
-									 }),
-									 this);
+					// ConnectInput defers focus loss until GTK settles child focus changes.
+					// Publishing metrics here would bypass that generation-checked decision.
 					gtk_widget_show_all(m_window);
 					gtk_widget_realize(m_widget);
 					gtk_widget_hide(m_window);
@@ -691,6 +727,8 @@ namespace WebFrontend
 				auto* gdkDisplay = gtk_widget_get_display(m_window);
 				auto* display = gdk_x11_display_get_xdisplay(gdk_window_get_display(gdkWindow));
 				const auto self = gdk_x11_window_get_xid(gdkWindow);
+				if (const auto active = ActiveToplevelXid(gdkDisplay); active && *active != self)
+					return; // Never answer a child focus event by fighting the compositor.
 				gdk_x11_display_error_trap_push(gdkDisplay);
 				::Window focused{};
 				int revert{};
@@ -975,6 +1013,34 @@ namespace WebFrontend
 					m_browserChild = None;
 			}
 
+			std::optional<InputWindow> GetActiveInputWindow() const override
+			{
+				// The WM's active toplevel is authoritative on XWayland. GTK can
+				// transiently report inactive when CEF moves focus to a native child.
+				const auto active = ActiveToplevelXid(gtk_widget_get_display(m_window));
+				const auto isActive = [&active](GtkWidget* widget) {
+					if (!widget)
+						return false;
+					if (!active)
+						return gtk_window_is_active(GTK_WINDOW(widget)) != FALSE;
+					auto* window = gtk_widget_get_window(widget);
+					return window && GDK_IS_X11_WINDOW(window) && gdk_x11_window_get_xid(window) == *active;
+				};
+				if (m_renderRegion && isActive(m_renderRegion->WindowWidget()))
+					return InputWindow::Game;
+				if (m_padRenderRegion && isActive(m_padRenderRegion->WindowWidget()))
+					return InputWindow::GamePad;
+				if (isActive(m_window))
+					return InputWindow::Launcher;
+				InputWindow result = InputWindow::Outside;
+				auto* windows = gtk_window_list_toplevels();
+				for (auto* item = windows; item; item = item->next)
+					if (isActive(GTK_WIDGET(item->data)))
+						result = InputWindow::Tool;
+				g_list_free(windows);
+				return result;
+			}
+
 			Host::WindowMetricsSnapshot GetMetrics() const override
 			{
 				GtkAllocation allocation{};
@@ -990,6 +1056,10 @@ namespace WebFrontend
 				}
 				else
 					gtk_widget_get_allocation(m_stack ? m_stack : m_window, &allocation);
+				const auto active = GetActiveInputWindow();
+				appActive = m_renderRegion
+								? active == InputWindow::Game || active == InputWindow::GamePad
+								: active == InputWindow::Launcher;
 				auto metrics = Host::WindowMetricsSnapshot{
 					.appActive = appActive,
 					.fullscreen = m_fullscreen,
@@ -1226,8 +1296,8 @@ namespace WebFrontend
 					gtk_widget_hide(m_textInput);
 					m_textInputSequence = 0;
 					m_textPreedit.clear();
-					if (m_renderRegion)
-						m_renderRegion->RequestFocus();
+					// Cancelling IME is also used on OS focus loss and overlay changes.
+					// It must not activate the game or steal focus from the chosen UI.
 					return;
 				}
 				if (!m_renderRegion)

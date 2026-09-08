@@ -61,6 +61,26 @@ namespace WebFrontend::CefOverlay
 		constexpr bool operator==(const InputOwnership&) const = default;
 	};
 
+	// The wire's TV ownership record carries the shared keyboard/text stream;
+	// pointer ownership remains per surface even while GamePad is active.
+	[[nodiscard]] inline InputOwnership MainStreamOwnership(InputWindow active,
+															InputOwnership main, const InputOwnership& pad)
+	{
+		if (active == InputWindow::GamePad)
+		{
+			main.keyboard = pad.keyboard;
+			main.text = pad.text;
+			main.webUiTextFocused = pad.webUiTextFocused;
+		}
+		else if (active != InputWindow::Game)
+		{
+			main.keyboard = InputOwner::None;
+			main.text = InputOwner::None;
+			main.webUiTextFocused = false;
+		}
+		return main;
+	}
+
 	struct OverlayInputTarget
 	{
 		std::uint64_t windowId{};

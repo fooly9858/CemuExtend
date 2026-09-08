@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host/contracts/HostContracts.h"
+#include "webview/InputFocusState.h"
 
 #include <functional>
 #include <memory>
@@ -96,6 +97,13 @@ namespace WebFrontend
 		using GameCloseHandler = std::function<void()>;
 		using InputHandler = std::function<void(const NativeInputEvent&)>;
 		virtual ~INativeWindowHost() = default;
+
+		// Backends opt into explicit activation tracking. Other platforms retain
+		// their existing input behavior until they implement this contract.
+		[[nodiscard]] virtual std::optional<InputWindow> GetActiveInputWindow() const
+		{
+			return {};
+		}
 
 		[[nodiscard]] virtual void* GetNativeWindow() const = 0;
 		[[nodiscard]] virtual Host::NativeWindowHandle GetMainWindowHandle() const = 0;

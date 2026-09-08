@@ -50,6 +50,7 @@ int main()
 	Frontend::CemuExtendFrontendBridge bridge;
 	const auto visible = bridge.ApplyPointerPolicy(1, 7, 1U << 2U, true, true);
 	assert(visible.ownsPointer && visible.showCursor && visible.confine);
+	assert(!bridge.RawMouseRequested());
 	const auto inactive = bridge.ApplyPointerPolicy(1, 7, 1U << 2U, false, true);
 	assert(inactive.ownsPointer && !inactive.confine);
 	const auto noCanvas = bridge.ApplyPointerPolicy(3, 0, 0, true, false);
@@ -91,6 +92,8 @@ int main()
 
 	const auto released = bridge.ApplyPointerPolicy(0, 0, 0, true, true);
 	assert(released.leavingPolicy && !released.ownsPointer && released.showCursor);
+	// UI hit testing must use absolute native coordinates after releasing capture.
+	assert(!bridge.RawMouseRequested());
 	const auto recaptured = bridge.ApplyPointerPolicy(1, 0, 0, true, true);
 	assert(recaptured.ownsPointer);
 	motion = bridge.UpdatePosition({10, 10}, {}, false);

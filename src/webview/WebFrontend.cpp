@@ -1702,7 +1702,8 @@ namespace
 		return result;
 	}
 
-	std::string RuntimeOverlayJson(const RuntimeOverlay::Snapshot& snapshot)
+	std::string RuntimeOverlayJson(const RuntimeOverlay::Snapshot& snapshot, bool resumeRequired = false,
+								   std::uint64_t focusRevision = 0)
 	{
 		rapidjson::StringBuffer buffer;
 		JsonWriter writer(buffer);
@@ -1720,6 +1721,10 @@ namespace
 		writer.StartObject();
 		writer.Key("sequence");
 		writer.String(std::to_string(snapshot.sequence).c_str());
+		writer.Key("resumeRequired");
+		writer.Bool(resumeRequired);
+		writer.Key("focusRevision");
+		writer.String(std::to_string(focusRevision).c_str());
 		writer.Key("overlayStyle");
 		writeStyle(snapshot.overlayStyle);
 		writer.Key("notificationStyle");
@@ -1924,27 +1929,18 @@ namespace
 					[this](std::uint64_t windowId) { HandleCefWindowClosed(windowId); },
 					[this](Host::PointerSurface surface,
 						   const WebFrontend::CefOverlay::InputOwnership& ownership) {
-						Application::PhysicalInputOwnership update;
-						update.surface = surface == Host::PointerSurface::Main
-											 ? Application::PointerSurface::Tv
-											 : Application::PointerSurface::Drc;
-						update.keyboardOwner = static_cast<std::uint8_t>(ownership.keyboard);
-						update.pointerOwner = static_cast<std::uint8_t>(ownership.pointer);
-						update.textOwner = static_cast<std::uint8_t>(ownership.text);
-						update.flags =
-							(ownership.webUiTextFocused
-								 ? static_cast<std::uint8_t>(cemuextend::wire::InputOwnershipFlag::WebUiTextFocused)
-								 : 0) |
-							(ownership.webUiPointerCaptured
-								 ? static_cast<std::uint8_t>(cemuextend::wire::InputOwnershipFlag::WebUiPointerCaptured)
-								 : 0);
-						m_controller.UpdatePhysicalInputOwnership(update);
-						cemuLog_log(LogType::Force,
-									"CEX2-INPUT ownership surface={} keyboard={} pointer={} text={}",
-									static_cast<unsigned>(surface),
-									static_cast<unsigned>(ownership.keyboard),
-									static_cast<unsigned>(ownership.pointer),
-									static_cast<unsigned>(ownership.text));
+						const auto index = surface == Host::PointerSurface::Main ? 0U : 1U;
+						m_surfaceInputOwnership[index] = ownership;
+						if (m_managedInputFocus)
+						{
+							PublishInputOwnership(Host::PointerSurface::Main,
+												  WebFrontend::CefOverlay::MainStreamOwnership(m_inputFocus.Window(),
+																							   m_surfaceInputOwnership[0], m_surfaceInputOwnership[1]));
+							if (surface == Host::PointerSurface::Pad)
+								PublishInputOwnership(surface, ownership);
+						}
+						else
+							PublishInputOwnership(surface, ownership);
 						m_webUiPointerOwnership[surface == Host::PointerSurface::Main ? 0 : 1] =
 							ownership.pointer == WebFrontend::CefOverlay::InputOwner::WebUi;
 						(void)RefreshPointerPolicy(surface);
@@ -3579,22 +3575,90 @@ namespace
 			}
 		}
 
+		void PublishInputOwnership(Host::PointerSurface surface,
+								   const WebFrontend::CefOverlay::InputOwnership& ownership)
+		{
+			Application::PhysicalInputOwnership update;
+			update.surface = surface == Host::PointerSurface::Main
+								 ? Application::PointerSurface::Tv
+								 : Application::PointerSurface::Drc;
+			update.keyboardOwner = static_cast<std::uint8_t>(ownership.keyboard);
+			update.pointerOwner = static_cast<std::uint8_t>(ownership.pointer);
+			update.textOwner = static_cast<std::uint8_t>(ownership.text);
+			update.flags =
+				(ownership.webUiTextFocused
+					 ? static_cast<std::uint8_t>(cemuextend::wire::InputOwnershipFlag::WebUiTextFocused)
+					 : 0) |
+				(ownership.webUiPointerCaptured
+					 ? static_cast<std::uint8_t>(cemuextend::wire::InputOwnershipFlag::WebUiPointerCaptured)
+					 : 0);
+			m_controller.UpdatePhysicalInputOwnership(update);
+			cemuLog_log(LogType::Force,
+						"CEX2-INPUT ownership surface={} keyboard={} pointer={} text={}",
+						static_cast<unsigned>(surface),
+						static_cast<unsigned>(ownership.keyboard),
+						static_cast<unsigned>(ownership.pointer),
+						static_cast<unsigned>(ownership.text));
+		}
+
+		static WebFrontend::InputWindow SurfaceWindow(Host::PointerSurface surface)
+		{
+			return surface == Host::PointerSurface::Main ? WebFrontend::InputWindow::Game
+														 : WebFrontend::InputWindow::GamePad;
+		}
+
+		bool InputAllowed(Host::PointerSurface surface) const
+		{
+			return !m_managedInputFocus || m_inputFocus.Allows(SurfaceWindow(surface));
+		}
+
+		void ApplyManagedInputFocus(const char* reason)
+		{
+			// Release before restoring any owner. Visibility/DOM focus intent survives.
+			ReleaseNativeInput(true, false);
+#if defined(CEMU_OVERLAY_BACKEND_CEF)
+			if (m_cefOverlay)
+				for (const auto surface : {Host::PointerSurface::Main, Host::PointerSurface::Pad})
+					m_cefOverlay->SetInputSuspended(surface, !InputAllowed(surface));
+#endif
+			for (const auto surface : {Host::PointerSurface::Main, Host::PointerSurface::Pad})
+				(void)RefreshPointerPolicy(surface);
+			cemuLog_log(LogType::Force,
+						"CEX2-FOCUS window={} mainAllowed={} padAllowed={} revision={} reason={}",
+						static_cast<unsigned>(m_inputFocus.Window()), InputAllowed(Host::PointerSurface::Main),
+						InputAllowed(Host::PointerSurface::Pad), m_inputFocus.Revision(), reason);
+			if (InputAllowed(Host::PointerSurface::Main))
+				RefreshTextInput();
+			SignalRuntimeOverlayChanged();
+		}
+
 		void HandleMetrics(Host::WindowMetricsSnapshot metrics)
 		{
-			// Store the same authoritative focus level that pointer events expose.
-			// Otherwise WindowGet can observe GTK's transient false sample and make
-			// the guest release every held key even though live MouseV2 was corrected.
-			metrics.appActive =
-				m_nativeKeyboardFocus.EffectivePointerFocus(metrics.appActive);
+			bool focusChanged = false;
+			if (const auto window = m_nativeWindow->GetActiveInputWindow())
+			{
+				m_managedInputFocus = true;
+				const bool playing = m_windowState && m_windowState->Snapshot().mode ==
+														  WebFrontend::MainWindowContentMode::Playing;
+				focusChanged = m_inputFocus.Observe(*window, playing);
+				// Query current native activation; a queued size/focus callback may
+				// carry an obsolete snapshot. Waiting for a click is not OS focus loss.
+				metrics.appActive = playing ? m_inputFocus.RenderActive()
+											: *window == WebFrontend::InputWindow::Launcher;
+			}
+			else
+				metrics.appActive = m_nativeKeyboardFocus.EffectivePointerFocus(metrics.appActive);
 			const auto previous = m_hostState->GetWindowMetrics();
 			m_hostState->UpdateMetrics(metrics);
+			if (focusChanged)
+				ApplyManagedInputFocus("activation");
 #if defined(CEMU_OVERLAY_BACKEND_CEF)
 			if (m_cefOverlay)
 			{
 				m_cefOverlay->SetInputSuspended(Host::PointerSurface::Main,
-												!metrics.appActive);
+												!metrics.appActive || !InputAllowed(Host::PointerSurface::Main));
 				m_cefOverlay->SetInputSuspended(Host::PointerSurface::Pad,
-												!metrics.appActive);
+												!metrics.appActive || !InputAllowed(Host::PointerSurface::Pad));
 				if (m_cefOverlay->HasWindow(0))
 				{
 					const auto browserBounds = m_nativeWindow->GetBrowserBounds();
@@ -3605,9 +3669,10 @@ namespace
 					// from the render window and leaves both Minecraft and the OSR Dock
 					// without usable input until the user changes focus manually.
 					const bool launcherFocused =
-						metrics.appActive &&
-						(!m_windowState || m_windowState->Snapshot().mode ==
-											   WebFrontend::MainWindowContentMode::Library);
+						m_managedInputFocus
+							? m_inputFocus.Window() == WebFrontend::InputWindow::Launcher
+							: metrics.appActive && (!m_windowState || m_windowState->Snapshot().mode ==
+																		  WebFrontend::MainWindowContentMode::Library);
 					m_cefOverlay->SetWindowFocus(0, launcherFocused);
 				}
 				m_cefOverlay->Resize(Host::PointerSurface::Main, metrics.physicalWidth,
@@ -3658,6 +3723,15 @@ namespace
 		{
 			auto& bridge = PointerBridge(surface);
 			const auto index = surface == Host::PointerSurface::Main ? 0U : 1U;
+			if (!InputAllowed(surface))
+			{
+				auto decision = bridge.ApplyPointerPolicy(0, 0, 0, false, false);
+				decision.showCursor = true;
+				m_nativeWindow->ApplyPointerPresentation({.surface = surface,
+														  .showCursor = true,
+														  .leavingPolicy = true});
+				return decision;
+			}
 			if (m_webUiPointerOwnership[index])
 			{
 				// The Dock owns the complete interactive surface. Keep this override in
@@ -3721,8 +3795,8 @@ namespace
 				.contentWidth = state.width,
 				.contentHeight = state.height,
 				.insideContent = state.inside,
-				.focused = m_nativeKeyboardFocus.EffectivePointerFocus(
-					metrics.appActive || event.windowActive),
+				.focused = m_managedInputFocus ? m_inputFocus.RenderActive()
+											   : m_nativeKeyboardFocus.EffectivePointerFocus(metrics.appActive || event.windowActive),
 				.flags = raw
 							 ? static_cast<std::uint8_t>(Frontend::CemuExtendMouseEventFlag::RawRelative)
 							 : static_cast<std::uint8_t>(0),
@@ -3999,6 +4073,38 @@ namespace
 											  normalized.kind == WebFrontend::NativeInputKind::TextComposition || normalized.kind == WebFrontend::NativeInputKind::TextAction
 										  ? 1
 										  : static_cast<std::uint16_t>(normalized.surface == Host::PointerSurface::Main ? 1 : 2);
+			// Bounded native pointer trace: distinguish a missing GTK event from a
+			// closed focus gate or an incorrect CEF target without logging each frame.
+			const bool tracePointer = normalized.kind == WebFrontend::NativeInputKind::PointerButton ||
+									  (normalized.kind == WebFrontend::NativeInputKind::PointerMove && m_webUiPointerOwnership[normalized.surface == Host::PointerSurface::Main ? 0 : 1]);
+			static std::atomic_uint32_t pointerTraceCount{};
+			const bool logPointer = tracePointer && pointerTraceCount.fetch_add(1, std::memory_order_relaxed) < 48;
+			if (logPointer)
+				cemuLog_log(LogType::Force, "CEX2-POINTER native kind={} surface={} x={} y={} button={} down={} allowed={}",
+							static_cast<unsigned>(normalized.kind), static_cast<unsigned>(normalized.surface),
+							normalized.x, normalized.y, normalized.button, normalized.pressed, InputAllowed(normalized.surface));
+			if (m_managedInputFocus || m_nativeWindow->GetActiveInputWindow())
+			{
+				if (!m_managedInputFocus ||
+					normalized.kind == WebFrontend::NativeInputKind::FocusLost)
+					HandleMetrics(m_nativeWindow->GetMetrics());
+				if (normalized.kind == WebFrontend::NativeInputKind::FocusLost)
+					return; // Current activation supersedes a delayed loss from another surface.
+				if (normalized.kind == WebFrontend::NativeInputKind::Key &&
+					m_inputFocus.FilterKey(normalized.deviceId, normalized.usagePage, normalized.usage,
+										   normalized.pressed, normalized.repeat,
+										   InputAllowed(normalized.surface)))
+					return;
+				if (!InputAllowed(normalized.surface))
+				{
+					if (normalized.kind == WebFrontend::NativeInputKind::PointerButton &&
+						normalized.button == 1 &&
+						m_inputFocus.ResumeClick(SurfaceWindow(normalized.surface), normalized.deviceId,
+												 normalized.pressed, normalized.insideContent))
+						ApplyManagedInputFocus("resume-click");
+					return;
+				}
+			}
 			const bool keyboardStateChanged =
 				normalized.kind == WebFrontend::NativeInputKind::Key && normalized.usage &&
 				m_nativeKeyboardFocus.SetKey(normalized.usage, normalized.pressed);
@@ -4052,6 +4158,10 @@ namespace
 			if (m_cefOverlay)
 				overlayTarget = m_cefOverlay->ResolveInput(normalized);
 #endif
+			if (logPointer)
+				cemuLog_log(LogType::Force, "CEX2-POINTER route target={} owner={} x={} y={} raw={}",
+							overlayTarget.windowId, static_cast<unsigned>(overlayTarget.ownership.pointer),
+							normalized.x, normalized.y, PointerBridge(normalized.surface).RawMouseRequested());
 			const auto route = WebFrontend::CefOverlay::ResolveNativeInputRoute(
 				normalized.kind, overlayTarget.ownership);
 			auto& bridge = PointerBridge(normalized.surface);
@@ -4114,7 +4224,7 @@ namespace
 						// Receiving a new native key-down proves that the game window
 						// owns keyboard input. Publish focus first so the ordered guest
 						// stream cannot reject this press using a stale GTK metric.
-						if (normalized.pressed && keyboardStateChanged)
+						if (!m_managedInputFocus && normalized.pressed && keyboardStateChanged)
 							ConfirmNativeKeyboardFocus();
 						m_controller.SubmitKeyboard(normalized.usagePage, normalized.usage,
 													normalized.pressed,
@@ -4150,6 +4260,9 @@ namespace
 					return;
 			}
 #endif
+			if (!route.processFrontendInput)
+				return;
+
 			switch (normalized.kind)
 			{
 			case WebFrontend::NativeInputKind::PointerMove:
@@ -4211,6 +4324,12 @@ namespace
 
 		void RefreshTextInput()
 		{
+			if (!InputAllowed(Host::PointerSurface::Main))
+			{
+				m_textInputSequence = 0;
+				m_nativeWindow->UpdateTextInput({});
+				return;
+			}
 			const auto state = m_controller.GetTextInputState();
 			m_textInputSequence = state.active ? state.sequence : 0;
 			m_nativeWindow->UpdateTextInput({
@@ -4475,7 +4594,10 @@ namespace
 		{
 			m_overlayFlushPending.store(false, std::memory_order_release);
 			const auto snapshot = m_controller.GetRuntimeOverlaySnapshot();
-			const auto payload = RuntimeOverlayJson(snapshot);
+			const auto payload = RuntimeOverlayJson(snapshot,
+													m_inputFocus.Waiting(WebFrontend::InputWindow::Game), m_inputFocus.Revision());
+			const auto padPayload = RuntimeOverlayJson(snapshot,
+													   m_inputFocus.Waiting(WebFrontend::InputWindow::GamePad), m_inputFocus.Revision());
 			m_overlayInteraction.store(snapshot.interaction, std::memory_order_release);
 #if defined(CEMU_OVERLAY_BACKEND_CEF)
 			if (m_cefOverlay)
@@ -4486,7 +4608,7 @@ namespace
 				std::scoped_lock eventLock(m_eventMutex);
 				const auto sequence = ++m_eventSequence;
 				m_cefOverlay->ExecuteEvent(Host::PointerSurface::Main, "overlay.changed", payload, sequence);
-				m_cefOverlay->ExecuteEvent(Host::PointerSurface::Pad, "overlay.changed", payload, sequence);
+				m_cefOverlay->ExecuteEvent(Host::PointerSurface::Pad, "overlay.changed", padPayload, sequence);
 			}
 #endif
 		}
@@ -5221,7 +5343,11 @@ namespace
 				if (m_invokingWindow != 0 && m_invokingWindow != kMainOverlayWindowId &&
 					m_invokingWindow != kPadOverlayWindowId)
 					throw std::runtime_error("runtime overlay state is available only to a render window");
-				return RuntimeOverlayJson(m_controller.GetRuntimeOverlaySnapshot());
+				return RuntimeOverlayJson(m_controller.GetRuntimeOverlaySnapshot(),
+										  m_inputFocus.Waiting(m_invokingWindow == kPadOverlayWindowId
+																   ? WebFrontend::InputWindow::GamePad
+																   : WebFrontend::InputWindow::Game),
+										  m_inputFocus.Revision());
 			});
 			m_rpc.Register("overlay.getShaderBackground", [this](const rapidjson::Value& params) {
 				if (m_invokingWindow != 0 && m_invokingWindow != kMainOverlayWindowId &&
@@ -6937,6 +7063,9 @@ namespace
 		std::array<Frontend::CemuExtendFrontendBridge, 2> m_pointerBridges;
 		std::array<bool, 2> m_webUiPointerOwnership{};
 		WebFrontend::NativeKeyboardFocusTracker m_nativeKeyboardFocus;
+		WebFrontend::InputFocusState m_inputFocus;
+		bool m_managedInputFocus{};
+		std::array<WebFrontend::CefOverlay::InputOwnership, 2> m_surfaceInputOwnership{};
 		mutable std::mutex m_hotkeyMutex;
 		Application::HotkeySettingsModel m_hotkeySettings;
 		std::atomic_bool m_hotkeyEditing{};

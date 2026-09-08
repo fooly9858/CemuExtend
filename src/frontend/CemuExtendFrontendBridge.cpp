@@ -23,7 +23,8 @@ namespace Frontend
 		const auto previousMode = m_pointerMode;
 		const auto effectiveMode = hasCanvas ? mode : kDefaultPointerMode;
 		m_pointerMode = effectiveMode;
-		m_rawMouseRequested = (flags & kDisableRawMouse) == 0;
+		m_rawMouseRequested = effectiveMode == kCapturedRelativePointerMode &&
+							  (flags & kDisableRawMouse) == 0;
 
 		CemuExtendPointerDecision decision;
 		decision.mode = effectiveMode;

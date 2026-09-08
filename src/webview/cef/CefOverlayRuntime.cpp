@@ -12,6 +12,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_dialog_handler.h"
+#include "include/cef_display_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_parser.h"
 #include "include/cef_permission_handler.h"
@@ -766,6 +767,7 @@ namespace WebFrontend::CefOverlay
 
 		class Client final : public CefClient,
 							 public CefLifeSpanHandler,
+							 public CefDisplayHandler,
 							 public CefRenderHandler,
 							 public CefLoadHandler,
 							 public CefRequestHandler,
@@ -784,6 +786,17 @@ namespace WebFrontend::CefOverlay
 			CefRefPtr<CefRenderHandler> GetRenderHandler() override
 			{
 				return m_descriptor.presentation == BrowserPresentation::OverlayOsr ? this : nullptr;
+			}
+			CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+			bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t,
+				const CefString& message, const CefString&, int) override
+			{
+				const auto text = message.ToString();
+				if (!text.starts_with("__CEMU_POINTER_PROBE__"))
+					return false;
+				cemuLog_log(LogType::Force, "CEX2-POINTER dom window={} {}",
+					WindowId(), text.substr(22, 1024));
+				return true;
 			}
 			CefRefPtr<CefLoadHandler> GetLoadHandler() override
 			{
@@ -1517,6 +1530,10 @@ namespace WebFrontend::CefOverlay
 				if (const auto* layer = FindLayerLocked(*layers.cemod);
 					layer && layer->cemodOrder == CemodOverlayOrder::BelowBuiltin)
 					order = CemodOverlayOrder::BelowBuiltin;
+			// The passive resume prompt must remain visible above a mod's Dock.
+			if ((&layers == &m_surfaces[0] && m_inputSuspended[0]) ||
+				(&layers == &m_surfaces[1] && m_inputSuspended[1]))
+				order = CemodOverlayOrder::BelowBuiltin;
 			std::array<std::optional<std::uint64_t>, 2> result;
 			const auto layerOrder = OverlayLayersBottomToTop(order);
 			for (std::size_t index = 0; index < layerOrder.size(); ++index)
@@ -2337,7 +2354,10 @@ namespace WebFrontend::CefOverlay
 		{
 			ResolvedSurfaceInput result;
 			if (m_inputSuspended[Index(surface)])
+			{
+				result.ownership = {InputOwner::None, InputOwner::None, InputOwner::None};
 				return result;
+			}
 			const auto& layers = m_surfaces[Index(surface)];
 			const auto order = BottomToTopLocked(layers);
 			for (auto layer = order.rbegin(); layer != order.rend(); ++layer)
@@ -2460,6 +2480,12 @@ namespace WebFrontend::CefOverlay
 					 (intent.generation == layer->inputIntent.generation &&
 					  intent.revision <= layer->inputIntent.revision)))
 					return true;
+				if (m_inputSuspended[Index(layer->surface)])
+				{
+					intent.ime = false;
+					intent.pointerCaptured = false;
+					intent.pointerId.reset();
+				}
 				layer->hasInputIntent = true;
 				layer->inputIntent = std::move(intent);
 				surface = layer->surface;
@@ -2484,11 +2510,30 @@ namespace WebFrontend::CefOverlay
 		void RuntimeImpl::SetInputSuspended(Host::PointerSurface surface, bool suspended)
 		{
 			InputOwnership ownership;
+			std::vector<CefRefPtr<Client>> clients;
 			{
 				std::scoped_lock lock(m_mutex);
 				if (m_inputSuspended[Index(surface)] == suspended)
 					return;
 				m_inputSuspended[Index(surface)] = suspended;
+				if (suspended)
+				{
+					const auto& layers = m_surfaces[Index(surface)];
+					for (const auto window : {layers.builtin, layers.cemod})
+						if (window)
+							if (const auto found = m_clients.find(*window); found != m_clients.end())
+								clients.push_back(found->second);
+					for (const auto window : {layers.builtin, layers.cemod})
+						if (window)
+							if (auto* layer = FindLayerLocked(*window))
+							{
+								// Preserve visibility and the requested keyboard owner for
+								// click-to-resume, but never resurrect a drag or composition.
+								layer->inputIntent.ime = false;
+								layer->inputIntent.pointerCaptured = false;
+								layer->inputIntent.pointerId.reset();
+							}
+				}
 				const auto& state = m_surfaces[Index(surface)];
 				ownership = ResolveSurfaceInputLocked(surface, state.pointerX,
 													  state.pointerY)
@@ -2496,11 +2541,19 @@ namespace WebFrontend::CefOverlay
 			}
 			NotifyInputOwnership(surface, ownership);
 			UpdateLayerFocus(surface);
+			for (const auto& client : clients)
+				if (client->Browser())
+				{
+					client->Browser()->GetHost()->SendCaptureLostEvent();
+					client->Browser()->GetHost()->ImeCancelComposition();
+				}
+			PublishComposite(surface);
 		}
 
 		void RuntimeImpl::ReleaseInput(Host::PointerSurface surface)
 		{
 			std::vector<CefRefPtr<Client>> clients;
+			InputOwnership ownership;
 			{
 				std::scoped_lock lock(m_mutex);
 				const auto& state = m_surfaces[Index(surface)];
@@ -2521,8 +2574,9 @@ namespace WebFrontend::CefOverlay
 					if (const auto client = m_clients.find(*window); client != m_clients.end())
 						clients.push_back(client->second);
 				}
+				ownership = ResolveSurfaceInputLocked(surface, state.pointerX, state.pointerY).ownership;
 			}
-			NotifyInputOwnership(surface, {});
+			NotifyInputOwnership(surface, ownership);
 			for (const auto& client : clients)
 				if (client->Browser())
 					client->Browser()->GetHost()->SetFocus(false);
@@ -2612,6 +2666,42 @@ namespace WebFrontend::CefOverlay
 				return false;
 			auto host = client->Browser()->GetHost();
 			const double scale = client->Scale();
+			// Bound diagnostics per browser, independently for motion and buttons.
+			// Do not record text or values from the page.
+			if (client->Descriptor().cemodAssets &&
+				(event.kind == NativeInputKind::PointerButton || event.kind == NativeInputKind::PointerMove))
+			{
+				static std::unordered_map<std::uint64_t, std::array<unsigned, 2>> traceCounts;
+				auto& count = traceCounts[windowId][event.kind == NativeInputKind::PointerButton ? 1 : 0];
+				if (count++ < 12)
+				{
+					const auto [width, height] = client->Size();
+					cemuLog_log(LogType::Force,
+						"CEX2-POINTER cef window={} kind={} x={} y={} inside={} view={}x{} scale={}",
+						windowId, static_cast<unsigned>(event.kind), event.x, event.y,
+						event.insideContent, width, height, scale);
+					if (auto frame = client->Browser()->GetMainFrame())
+					{
+						const auto script = std::string(R"JS((() => {
+							const describe = e => e ? {tag:e.tagName, rect:{x:e.getBoundingClientRect().x,
+								y:e.getBoundingClientRect().y,width:e.getBoundingClientRect().width,
+								height:e.getBoundingClientRect().height}} : null;
+							const report = data => console.debug('__CEMU_POINTER_PROBE__' + JSON.stringify(data));
+							if (!window.__cemuPointerProbe) {
+								window.__cemuPointerProbe = true;
+								let remaining = 24;
+								for (const type of ['pointermove','pointerdown','pointerup','click'])
+									window.addEventListener(type, e => { if (remaining-- > 0)
+										report({event:type,x:e.clientX,y:e.clientY,target:describe(e.target)}); }, true);
+							}
+							report({probe:true,focused:document.hasFocus(),width:innerWidth,height:innerHeight,
+								target:describe(document.elementFromPoint()JS") +
+							std::to_string(static_cast<int>(std::lround(event.x / scale))) + "," +
+							std::to_string(static_cast<int>(std::lround(event.y / scale))) + "))});})()";
+						frame->ExecuteJavaScript(script, frame->GetURL(), 0);
+					}
+				}
+			}
 			CefMouseEvent mouse;
 			mouse.x = static_cast<int>(std::lround(event.x / scale));
 			mouse.y = static_cast<int>(std::lround(event.y / scale));
